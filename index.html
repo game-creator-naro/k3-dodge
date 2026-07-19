@@ -1,0 +1,983 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Game</title>
+<style>
+  * {
+    box-sizing: border-box;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0b1020;
+    touch-action: none;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  /* 画面全体を覆い、iOS のノッチ/ホームバー領域を safe-area で避ける（CLAUDE.md 絶対規約） */
+  #stage {
+    position: fixed;
+    inset: 0;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game" aria-label="ゲーム画面">
+    このブラウザは Canvas に対応していません。
+  </canvas>
+</div>
+<!--
+  RUNTIME_VERSION: このファイル + games/runtime/gamekit.js の組み合わせのバージョン。
+  apps/platform/src/gen/compose.ts の SUPPORTED_RUNTIME_VERSION と一致させる
+  （不一致は合成を拒否する = 保存済み HTML は不変というルールを守るため）。
+-->
+<script>var RUNTIME_VERSION = "rt-2";</script>
+<!--
+  GameKit と生成ロジックは別のスクリプト要素にする。ロジックが構文エラーでも
+  GameKit 側のエラー収集・診断チャネル確立は独立して機能する（docs/m2-design.md）。
+-->
+<script>
+// GameKit: プラットフォーム提供の固定ランタイム（依存ゼロ IIFE）。
+// AI 生成ロジックはこの window.GameKit 経由でのみ画面・入力・音を扱う
+// （docs/architecture.md 原則 4・docs/m2-design.md「固定ランタイム」）。
+//
+// 公開 API（apps/platform/src/gen/static-check.ts の許可リストと同期させること）:
+//   GameKit.run({ title, instructions, emoji, init, update(dt), draw(ctx), onTap, onDrag })
+//   GameKit.emoji(ctx, char, x, y, sizePx, color?)
+//   GameKit.text(ctx, str, x, y, { size, font, color, align, baseline }?)
+//   GameKit.score.add(n) / .set(n) / .get()
+//   GameKit.gameOver()
+//   GameKit.width() / GameKit.height()  … canvas の CSS ピクセルサイズ
+//   GameKit.sfx.play("tap" | "score" | "hit" | "clear")
+(function (global) {
+  'use strict';
+
+  // iOS Safari の Canvas は sans-serif から Apple Color Emoji へ自動フォールバックしない
+  // ため、絵文字を描く ctx.font には必ずこのスタックを使う（architecture.md 原則 4）。
+  var EMOJI_FONT_STACK = '"Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+
+  var STATE = Object.freeze({ TITLE: 'title', PLAYING: 'playing', GAMEOVER: 'gameover' });
+
+  var MAX_DELTA_TIME = 0.1; // タブ非アクティブ復帰時などの大ジャンプ防止(s)
+  var RETRY_BUTTON_WIDTH = 220;
+  var RETRY_BUTTON_HEIGHT = 64;
+  var RETRY_BUTTON_Y_RATIO = 0.62;
+  var MAX_REPORTED_ERRORS = 20; // 診断チャネルへの連投防止（同一フレームで例外が続くケース対策）
+  var MAX_PENDING_ERRORS = MAX_REPORTED_ERRORS;
+
+  // ==========================================================================
+  // 診断チャネル（共有インターフェース 7）
+  // 親 → iframe: window.postMessage({kind:"gamekit-init", versionId}, "*", [port2])
+  // iframe → 親: port.postMessage({kind:"gamekit-error"|"gamekit-ready", ...})
+  // ==========================================================================
+
+  var diagPort = null;
+  var diagVersionId = null;
+  var reportedErrorCount = 0;
+  var pendingErrors = []; // port 確立前に発生したエラーを溜めておき、確立後にまとめて送る
+  var runSucceeded = false;
+  var readySent = false;
+
+  function sendErrorPayload(payload) {
+    reportedErrorCount += 1;
+    try {
+      diagPort.postMessage(payload);
+    } catch (e) {
+      // port が閉じている等は握りつぶす（診断送信の失敗でゲーム進行を止めない）
+    }
+  }
+
+  function reportError(message, stack) {
+    if (reportedErrorCount >= MAX_REPORTED_ERRORS) {
+      return;
+    }
+    var payload = {
+      kind: 'gamekit-error',
+      versionId: diagVersionId,
+      message: String(message === null || message === undefined ? 'unknown error' : message),
+      stack: stack ? String(stack) : undefined
+    };
+    if (!diagPort) {
+      if (pendingErrors.length < MAX_PENDING_ERRORS) {
+        pendingErrors.push(payload);
+      }
+      return;
+    }
+    sendErrorPayload(payload);
+  }
+
+  function tryReportReady() {
+    if (readySent || !diagPort || !runSucceeded) {
+      return;
+    }
+    readySent = true;
+    try {
+      diagPort.postMessage({ kind: 'gamekit-ready', versionId: diagVersionId });
+    } catch (e) {}
+  }
+
+  // オペークオリジンでは event.origin が "null" になり送信元検証に使えないため、
+  // MessageChannel の port を専有すること自体を認証代わりにする（m2-design.md）。
+  // このリスナーは GameKit スクリプトが生成ロジックより先に読み込まれるため必ず先着し、
+  // stopImmediatePropagation で後続リスナー（生成ロジックが window に登録し得るもの）
+  // に同じイベント・同じ port を渡さない。
+  global.addEventListener('message', function (event) {
+    var data = event.data;
+    if (!data || data.kind !== 'gamekit-init') {
+      return;
+    }
+    event.stopImmediatePropagation();
+    diagVersionId = typeof data.versionId === 'string' ? data.versionId : null;
+    diagPort = (event.ports && event.ports[0]) || null;
+    if (!diagPort) {
+      return;
+    }
+    for (var i = 0; i < pendingErrors.length; i++) {
+      pendingErrors[i].versionId = diagVersionId;
+      sendErrorPayload(pendingErrors[i]);
+    }
+    pendingErrors = [];
+    tryReportReady();
+  });
+
+  global.addEventListener('error', function (event) {
+    reportError(event.message, event.error && event.error.stack);
+  });
+  global.addEventListener('unhandledrejection', function (event) {
+    var reason = event.reason;
+    reportError(reason && reason.message ? reason.message : String(reason), reason && reason.stack);
+  });
+
+  // ==========================================================================
+  // 内部状態（closure に隠蔽。生成ロジックは window.GameKit 経由でしか触れない）
+  // ==========================================================================
+
+  var config = null;
+  var started = false;
+  var state = STATE.TITLE;
+  var score = 0;
+  var canvas = null;
+  var ctx = null;
+  var cssWidth = 0;
+  var cssHeight = 0;
+  var pointerId = null;
+  var pointerActive = false;
+  var lastPointerX = 0;
+  var lastPointerY = 0;
+  var lastFrameTime = 0;
+  var audioCtx = null;
+
+  // ==========================================================================
+  // Canvas / DPR
+  // ==========================================================================
+
+  function resizeCanvas() {
+    if (!canvas) {
+      return;
+    }
+    var rect = canvas.getBoundingClientRect();
+    cssWidth = rect.width;
+    cssHeight = rect.height;
+    var dpr = global.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(cssWidth * dpr));
+    canvas.height = Math.max(1, Math.round(cssHeight * dpr));
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function getRelativePos(e) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  // ==========================================================================
+  // Audio（プロシージャル SE。AudioContext はタップ起点でのみ生成/resume する）
+  // ==========================================================================
+
+  function ensureAudio() {
+    if (!audioCtx) {
+      var AudioContextClass = global.AudioContext || global.webkitAudioContext;
+      if (!AudioContextClass) {
+        return;
+      }
+      audioCtx = new AudioContextClass();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume()['catch'](function () {});
+    }
+  }
+
+  function playToneAt(delay, freq, freqEnd, duration, type, volume) {
+    if (!audioCtx) {
+      return;
+    }
+    var start = audioCtx.currentTime + delay;
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    if (freqEnd !== undefined) {
+      osc.frequency.linearRampToValueAtTime(freqEnd, start + duration);
+    }
+    gain.gain.setValueAtTime(volume, start);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(start);
+    osc.stop(start + duration + 0.02);
+  }
+
+  var SFX = {
+    tap: function () { playToneAt(0, 660, 880, 0.08, 'sine', 0.2); },
+    score: function () { playToneAt(0, 880, 1320, 0.12, 'triangle', 0.22); },
+    hit: function () { playToneAt(0, 220, 60, 0.35, 'sawtooth', 0.3); },
+    clear: function () {
+      playToneAt(0, 660, 880, 0.12, 'triangle', 0.2);
+      playToneAt(0.1, 990, 1320, 0.16, 'triangle', 0.2);
+    }
+  };
+
+  function playSfx(name) {
+    var fn = SFX[name];
+    if (typeof fn === 'function') {
+      fn();
+    }
+  }
+
+  // ==========================================================================
+  // 状態機械・入力
+  // ==========================================================================
+
+  function safeCall(fn, args, label) {
+    if (typeof fn !== 'function') {
+      return undefined;
+    }
+    try {
+      return fn.apply(null, args);
+    } catch (err) {
+      reportError(label + ': ' + (err && err.message ? err.message : String(err)), err && err.stack);
+      return undefined;
+    }
+  }
+
+  function safeDraw() {
+    // draw は生成ロジックが ctx の状態（fillStyle 等）を変更し得るため、
+    // GameKit 自身の HUD/タイトル/リザルト描画に影響しないよう save/restore で境界を切る。
+    ctx.save();
+    try {
+      if (typeof config.draw === 'function') {
+        config.draw(ctx);
+      }
+    } catch (err) {
+      reportError('draw: ' + (err && err.message ? err.message : String(err)), err && err.stack);
+    } finally {
+      ctx.restore();
+    }
+  }
+
+  function beginSession() {
+    score = 0;
+    pointerActive = false;
+    pointerId = null;
+    safeCall(config.init, [], 'init');
+  }
+
+  function startGame() {
+    beginSession();
+    state = STATE.PLAYING;
+    playSfx('tap');
+  }
+
+  function triggerGameOver() {
+    state = STATE.GAMEOVER;
+    pointerActive = false;
+    playSfx('hit');
+  }
+
+  function getRetryButtonRect() {
+    return {
+      x: cssWidth / 2 - RETRY_BUTTON_WIDTH / 2,
+      y: cssHeight * RETRY_BUTTON_Y_RATIO,
+      width: RETRY_BUTTON_WIDTH,
+      height: RETRY_BUTTON_HEIGHT
+    };
+  }
+
+  function isInsideRect(x, y, rect) {
+    return x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height;
+  }
+
+  function onPointerDown(e) {
+    if (e.button !== undefined && e.button > 0) {
+      return; // 右クリック等は無視
+    }
+    e.preventDefault();
+    var pos = getRelativePos(e);
+
+    if (state === STATE.TITLE) {
+      ensureAudio(); // 「タップしてスタート」ゲート: 初回タップ内で生成/resume する
+      startGame();
+      return;
+    }
+    if (state === STATE.GAMEOVER) {
+      if (isInsideRect(pos.x, pos.y, getRetryButtonRect())) {
+        ensureAudio();
+        startGame();
+      }
+      return;
+    }
+
+    // PLAYING: ドラッグ開始点として記録しつつ、離散的な「タップ」としても通知する。
+    pointerActive = true;
+    pointerId = e.pointerId;
+    lastPointerX = pos.x;
+    lastPointerY = pos.y;
+    if (canvas.setPointerCapture) {
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch (err) {
+        // 一部ブラウザで無効な pointerId の場合は無視して続行
+      }
+    }
+    safeCall(config.onTap, [{ x: pos.x, y: pos.y }], 'onTap');
+  }
+
+  function onPointerMove(e) {
+    if (state !== STATE.PLAYING || !pointerActive || e.pointerId !== pointerId) {
+      return;
+    }
+    e.preventDefault();
+    var pos = getRelativePos(e);
+    var dx = pos.x - lastPointerX;
+    var dy = pos.y - lastPointerY;
+    lastPointerX = pos.x;
+    lastPointerY = pos.y;
+    safeCall(config.onDrag, [{ x: pos.x, y: pos.y, dx: dx, dy: dy }], 'onDrag');
+  }
+
+  function onPointerUp(e) {
+    if (e.pointerId === pointerId) {
+      pointerActive = false;
+      pointerId = null;
+    }
+  }
+
+  // ==========================================================================
+  // 描画: GameKit 共通 UI（タイトル / HUD / ゲームオーバー・リトライ）
+  // ==========================================================================
+
+  // タイトル背景と同じダーク系単色。frame() が毎フレーム最初にこれで全面クリアしてから
+  // 各状態の描画を呼ぶため、タイトル画面の描画自体はもう背景を塗る必要がない
+  // （塗ると二重に塗るだけで無害だが、クリア責務を frame() 側に一本化して漏れを防ぐ）。
+  var BACKGROUND_COLOR = '#101833';
+
+  function clearCanvas() {
+    ctx.fillStyle = BACKGROUND_COLOR;
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+  }
+
+  function drawTitleScreen() {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    if (config.emoji) {
+      drawEmoji(ctx, config.emoji, cssWidth / 2, cssHeight * 0.38, 56);
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 30px sans-serif';
+    ctx.fillText(config.title || 'ゲーム', cssWidth / 2, cssHeight * 0.56);
+
+    if (config.instructions) {
+      ctx.font = '16px sans-serif';
+      ctx.fillText(config.instructions, cssWidth / 2, cssHeight * 0.66);
+    }
+
+    ctx.font = '22px sans-serif';
+    ctx.fillText('タップしてスタート', cssWidth / 2, cssHeight * 0.78);
+  }
+
+  function drawHud() {
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '20px sans-serif';
+    ctx.fillText('スコア: ' + Math.floor(score), 16, 16);
+  }
+
+  function drawRoundedRect(x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + width, y, x + width, y + height, radius);
+    ctx.arcTo(x + width, y + height, x, y + height, radius);
+    ctx.arcTo(x, y + height, x, y, radius);
+    ctx.arcTo(x, y, x + width, y, radius);
+    ctx.closePath();
+  }
+
+  function drawGameOverOverlay() {
+    ctx.fillStyle = 'rgba(8, 10, 24, 0.72)';
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 32px sans-serif';
+    ctx.fillText('ゲームオーバー', cssWidth / 2, cssHeight * 0.34);
+
+    ctx.font = '24px sans-serif';
+    ctx.fillText('スコア: ' + Math.floor(score), cssWidth / 2, cssHeight * 0.44);
+
+    var rect = getRetryButtonRect();
+    ctx.fillStyle = '#ff6b6b';
+    drawRoundedRect(rect.x, rect.y, rect.width, rect.height, 16);
+    ctx.fill();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.fillText('もういちど', cssWidth / 2, rect.y + rect.height / 2);
+  }
+
+  // ==========================================================================
+  // メインループ
+  // ==========================================================================
+
+  function frame(timestamp) {
+    if (!lastFrameTime) {
+      lastFrameTime = timestamp;
+    }
+    var dt = Math.min(MAX_DELTA_TIME, (timestamp - lastFrameTime) / 1000);
+    lastFrameTime = timestamp;
+
+    if (state === STATE.PLAYING) {
+      safeCall(config.update, [dt], 'update');
+    }
+
+    // 生成ロジックの draw を呼ぶ前に必ず全面クリアする。クリアしないと前フレームの
+    // タイトル画面・移動物の軌跡・ゲームオーバーの半透明オーバーレイが重なって
+    // 残り続ける（外部レビュー P2-9）。
+    clearCanvas();
+
+    if (state === STATE.TITLE) {
+      drawTitleScreen();
+    } else if (state === STATE.PLAYING) {
+      safeDraw();
+      drawHud();
+    } else if (state === STATE.GAMEOVER) {
+      safeDraw();
+      drawGameOverOverlay();
+    }
+
+    global.requestAnimationFrame(frame);
+  }
+
+  // ==========================================================================
+  // 公開 API
+  // ==========================================================================
+
+  function validateConfig(cfg) {
+    var required = ['init', 'update', 'draw'];
+    for (var i = 0; i < required.length; i++) {
+      if (typeof cfg[required[i]] !== 'function') {
+        reportError('GameKit.run: "' + required[i] + '" は関数である必要があります');
+      }
+    }
+  }
+
+  function run(cfg) {
+    if (started) {
+      reportError('GameKit.run: 既に開始済みです（二重呼び出し）');
+      return;
+    }
+    started = true;
+    config = cfg || {};
+    validateConfig(config);
+
+    canvas = global.document.getElementById('game');
+    if (!canvas) {
+      reportError('GameKit.run: #game canvas が見つかりません');
+      return;
+    }
+    ctx = canvas.getContext('2d');
+    if (!ctx) {
+      reportError('GameKit.run: 2D コンテキストを取得できません');
+      return;
+    }
+
+    resizeCanvas();
+    global.addEventListener('resize', resizeCanvas);
+    global.addEventListener('orientationchange', function () {
+      // iOS は回転直後に viewport 寸法が確定していないことがあるため少し待つ
+      setTimeout(resizeCanvas, 150);
+    });
+    if (global.visualViewport) {
+      global.visualViewport.addEventListener('resize', resizeCanvas);
+    }
+
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerUp);
+    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+    global.requestAnimationFrame(frame);
+
+    runSucceeded = true;
+    tryReportReady();
+  }
+
+  function resolveDrawColor(targetCtx, color) {
+    if (typeof color === 'string') {
+      return color;
+    }
+    // fillStyle にグラデーション/パターンが残ったまま絵文字を描くと iOS Safari で
+    // 描画されない/背景に同化する実害があるため、単色でなければ既定色に落とす
+    // （architecture.md 原則 4）。
+    return typeof targetCtx.fillStyle === 'string' ? targetCtx.fillStyle : '#ffffff';
+  }
+
+  function drawEmoji(targetCtx, char, x, y, size, color) {
+    var c = targetCtx || ctx;
+    c.save();
+    c.font = size + 'px ' + EMOJI_FONT_STACK;
+    c.fillStyle = resolveDrawColor(c, color);
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    c.fillText(char, x, y);
+    c.restore();
+  }
+
+  function drawText(targetCtx, str, x, y, options) {
+    var c = targetCtx || ctx;
+    options = options || {};
+    c.save();
+    var size = options.size || 16;
+    c.font = options.font || (size + 'px sans-serif');
+    c.fillStyle = resolveDrawColor(c, options.color);
+    c.textAlign = options.align || 'center';
+    c.textBaseline = options.baseline || 'middle';
+    c.fillText(str, x, y);
+    c.restore();
+  }
+
+  function scoreAdd(n) {
+    if (typeof n === 'number' && isFinite(n)) {
+      score += n;
+    }
+  }
+  function scoreSet(n) {
+    score = (typeof n === 'number' && isFinite(n)) ? n : 0;
+  }
+  function scoreGet() {
+    return score;
+  }
+
+  function gameOver() {
+    if (state === STATE.PLAYING) {
+      triggerGameOver();
+    }
+  }
+
+  function width() { return cssWidth; }
+  function height() { return cssHeight; }
+
+  var GameKit = {
+    run: run,
+    emoji: drawEmoji,
+    text: drawText,
+    score: { add: scoreAdd, set: scoreSet, get: scoreGet },
+    gameOver: gameOver,
+    width: width,
+    height: height,
+    sfx: { play: playSfx }
+  };
+
+  Object.freeze(GameKit.score);
+  Object.freeze(GameKit.sfx);
+  Object.freeze(GameKit);
+
+  // window.GameKit を書き込み不可・再定義不可にする。Object.freeze(GameKit) は
+  // オブジェクト自身のプロパティしか保護しないため、これが無いと生成ロジックが
+  // `GameKit = {...}` で参照ごとすり替えられ、上の防御が無意味になる。
+  Object.defineProperty(global, 'GameKit', {
+    value: GameKit,
+    writable: false,
+    configurable: false,
+    enumerable: true
+  });
+})(window);
+
+</script>
+<script>
+let player, rocks, particles, warnings, spawnTimer, meteorTimer, elapsed, phase, dieTimer, bgT;
+let bestScore = 0;
+let newBest = false;
+
+const ROCK_TYPES = {
+  normal: { fill: "#8d8d99", stroke: "#55555f", crater: "#6c6c78", score: 1 },
+  ice: { fill: "#a9dcf0", stroke: "#5fa8c9", crater: "#7fc2dd", score: 1 },
+  lava: { fill: "#63322e", stroke: "#3d1b18", crater: "#ff7b3a", score: 2 },
+  gold: { fill: "#f2c14e", stroke: "#b8860b", crater: "#d9a832", score: 5 }
+};
+
+function lerpColor(c1, c2, t) {
+  const a = parseInt(c1.slice(1), 16);
+  const b = parseInt(c2.slice(1), 16);
+  const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+  const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
+  const r = Math.round(ar + (br - ar) * t);
+  const g = Math.round(ag + (bg - ag) * t);
+  const bl = Math.round(ab + (bb - ab) * t);
+  return "rgb(" + r + "," + g + "," + bl + ")";
+}
+
+function pickType() {
+  const r = Math.random();
+  if (r < 0.5) return "normal";
+  if (r < 0.72) return "ice";
+  if (r < 0.94) return "lava";
+  return "gold";
+}
+
+function spawnRock(speed) {
+  const W = GameKit.width();
+  const type = pickType();
+  let size = 24 + Math.random() * 32;
+  let vy = speed + Math.random() * 90;
+  if (type === "gold") { size *= 0.7; vy *= 1.1; }
+  if (type === "lava") { size *= 1.15; vy *= 1.12; }
+  if (type === "ice") { vy *= 0.92; }
+  const n = 8;
+  const verts = [];
+  for (let i = 0; i < n; i++) verts.push(0.72 + Math.random() * 0.36);
+  rocks.push({
+    type: type,
+    x: size + Math.random() * Math.max(1, W - size * 2),
+    y: -size,
+    vx: (Math.random() - 0.5) * 36,
+    vy: vy,
+    size: size,
+    verts: verts,
+    rot: Math.random() * Math.PI * 2,
+    rotSpeed: (Math.random() - 0.5) * 4
+  });
+}
+
+function spawnMeteor(x) {
+  rocks.push({
+    type: "meteor",
+    x: x,
+    y: -30,
+    vx: (Math.random() - 0.5) * 100,
+    vy: 620 + Math.random() * 180 + elapsed * 2,
+    size: 36,
+    rot: 0,
+    rotSpeed: 0
+  });
+}
+
+function drawRock(ctx, r) {
+  const t = ROCK_TYPES[r.type];
+  ctx.save();
+  ctx.translate(r.x, r.y);
+  ctx.rotate(r.rot);
+  ctx.beginPath();
+  const n = r.verts.length;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    const rad = r.size * 0.5 * r.verts[i];
+    const px = Math.cos(a) * rad;
+    const py = Math.sin(a) * rad;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = t.fill;
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = t.stroke;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(-r.size * 0.1, -r.size * 0.08, r.size * 0.13, 0, Math.PI * 2);
+  ctx.fillStyle = t.crater;
+  ctx.fill();
+  if (r.type === "lava") {
+    ctx.beginPath();
+    ctx.arc(r.size * 0.15, r.size * 0.12, r.size * 0.07, 0, Math.PI * 2);
+    ctx.arc(-r.size * 0.18, r.size * 0.16, r.size * 0.05, 0, Math.PI * 2);
+    ctx.fillStyle = "#ff9a3c";
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawMeteor(ctx, r) {
+  for (let k = 6; k >= 1; k--) {
+    const tx = r.x - r.vx * k * 0.03;
+    const ty = r.y - r.vy * k * 0.03;
+    ctx.globalAlpha = 0.4 * (1 - k / 7);
+    ctx.fillStyle = k % 2 === 0 ? "#ffb347" : "#ff7b3a";
+    ctx.beginPath();
+    ctx.arc(tx, ty, r.size * 0.4 * (1 - k / 8), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  GameKit.emoji(ctx, "☄️", r.x, r.y, r.size);
+}
+
+function explode() {
+  for (let i = 0; i < 30; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 50 + Math.random() * 240;
+    const life = 0.4 + Math.random() * 0.5;
+    particles.push({
+      x: player.x,
+      y: player.y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp,
+      life: life,
+      maxLife: life,
+      size: 3 + Math.random() * 5,
+      color: Math.random() < 0.5 ? "#ffb347" : "#ff5b4d"
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 300 * dt;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+GameKit.run({
+  title: "ロックドッジ",
+  instructions: "ドラッグでよけ続けよう！金の岩や流れ星は高得点！スコア100で空の色が変わるぞ！",
+  emoji: "🚀",
+  init() {
+    player = { x: GameKit.width() / 2, y: GameKit.height() * 0.75, r: 18 };
+    rocks = [];
+    particles = [];
+    warnings = [];
+    spawnTimer = 0.5;
+    meteorTimer = 7;
+    elapsed = 0;
+    phase = "play";
+    dieTimer = 0;
+    bgT = 0;
+    newBest = false;
+    GameKit.score.set(0);
+  },
+  update(dt) {
+    const W = GameKit.width();
+    const H = GameKit.height();
+
+    const bgTarget = GameKit.score.get() > 100 ? 1 : 0;
+    bgT += (bgTarget - bgT) * Math.min(1, dt * 2);
+
+    if (phase === "dying") {
+      dieTimer -= dt;
+      for (let i = rocks.length - 1; i >= 0; i--) {
+        const r = rocks[i];
+        r.y += r.vy * dt;
+        r.x += r.vx * dt;
+        r.rot += r.rotSpeed * dt;
+        if (r.y - r.size > H) rocks.splice(i, 1);
+      }
+      updateParticles(dt);
+      if (dieTimer <= 0) {
+        const s = GameKit.score.get();
+        newBest = s > bestScore;
+        if (newBest) bestScore = s;
+        phase = "over";
+        GameKit.gameOver();
+      }
+      return;
+    }
+
+    elapsed += dt;
+
+    const interval = Math.max(0.24, 0.8 - elapsed * 0.012);
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) {
+      spawnTimer = interval;
+      spawnRock(Math.min(480, 150 + elapsed * 7));
+    }
+
+    if (elapsed > 5) {
+      meteorTimer -= dt;
+      if (meteorTimer <= 0) {
+        meteorTimer = Math.max(2.5, 6 - elapsed * 0.03) + Math.random() * 3;
+        warnings.push({ x: 30 + Math.random() * Math.max(1, W - 60), t: 0.7 });
+      }
+    }
+    for (let i = warnings.length - 1; i >= 0; i--) {
+      warnings[i].t -= dt;
+      if (warnings[i].t <= 0) {
+        spawnMeteor(warnings[i].x);
+        warnings.splice(i, 1);
+      }
+    }
+
+    for (let i = rocks.length - 1; i >= 0; i--) {
+      const r = rocks[i];
+      r.y += r.vy * dt;
+      r.x += r.vx * dt;
+      r.rot += r.rotSpeed * dt;
+      if (r.y - r.size > H) {
+        rocks.splice(i, 1);
+        const pts = r.type === "meteor" ? 3 : ROCK_TYPES[r.type].score;
+        GameKit.score.add(pts);
+        GameKit.sfx.play(pts >= 3 ? "clear" : "score");
+        continue;
+      }
+      const dx = r.x - player.x;
+      const dy = r.y - player.y;
+      const hit = r.size * 0.38 + player.r * 0.75;
+      if (dx * dx + dy * dy < hit * hit) {
+        phase = "dying";
+        dieTimer = 0.9;
+        explode();
+        GameKit.sfx.play("hit");
+        return;
+      }
+    }
+
+    updateParticles(dt);
+  },
+  draw(ctx) {
+    const W = GameKit.width();
+    const H = GameKit.height();
+
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, lerpColor("#10162e", "#33101f", bgT));
+    g.addColorStop(1, lerpColor("#25355c", "#7a2430", bgT));
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    for (let i = 0; i < 50; i++) {
+      const sx = (((i * 197.3 + 53) % 100) / 100) * W;
+      const sy = ((((i * 113.7 + 29) % 100) / 100) * H + elapsed * (10 + (i % 5) * 8)) % H;
+      const s = (i % 3) + 1;
+      ctx.globalAlpha = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(elapsed * 2 + i));
+      ctx.fillStyle = lerpColor("#ffffff", "#ffb0a0", bgT);
+      ctx.fillRect(sx, sy, s, s);
+    }
+    ctx.globalAlpha = 1;
+
+    if (phase === "play") {
+      for (const w of warnings) {
+        const pulse = 0.5 + 0.5 * Math.sin(elapsed * 20);
+        ctx.globalAlpha = 0.4 + 0.6 * pulse;
+        ctx.fillStyle = "#ff5252";
+        ctx.beginPath();
+        ctx.moveTo(w.x - 14, 8);
+        ctx.lineTo(w.x + 14, 8);
+        ctx.lineTo(w.x, 34);
+        ctx.closePath();
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+    }
+
+    for (const r of rocks) {
+      if (r.type === "meteor") drawMeteor(ctx, r);
+      else drawRock(ctx, r);
+    }
+
+    if (phase === "play") {
+      const fl = 10 + Math.sin(elapsed * 30) * 4;
+      ctx.beginPath();
+      ctx.moveTo(player.x - 7, player.y + 16);
+      ctx.lineTo(player.x + 7, player.y + 16);
+      ctx.lineTo(player.x, player.y + 24 + fl);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(255,160,40,0.9)";
+      ctx.fill();
+      GameKit.emoji(ctx, "🚀", player.x, player.y, 44);
+    }
+
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    if (phase === "over") {
+      const cx = W / 2;
+      const cy = H * 0.22;
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.beginPath();
+      ctx.moveTo(cx - 130 + 12, cy - 34);
+      ctx.lineTo(cx + 130 - 12, cy - 34);
+      ctx.arcTo(cx + 130, cy - 34, cx + 130, cy - 34 + 12, 12);
+      ctx.lineTo(cx + 130, cy + 34 - 12);
+      ctx.arcTo(cx + 130, cy + 34, cx + 130 - 12, cy + 34, 12);
+      ctx.lineTo(cx - 130 + 12, cy + 34);
+      ctx.arcTo(cx - 130, cy + 34, cx - 130, cy + 34 - 12, 12);
+      ctx.lineTo(cx - 130, cy - 34 + 12);
+      ctx.arcTo(cx - 130, cy - 34, cx - 130 + 12, cy - 34, 12);
+      ctx.closePath();
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(255,215,94,0.8)";
+      ctx.stroke();
+
+      GameKit.emoji(ctx, "🏆", cx - 80, cy, 32);
+      GameKit.text(ctx, "ベスト " + bestScore, cx + 18, cy, {
+        size: 26,
+        color: "#ffd75e",
+        align: "center",
+        baseline: "middle"
+      });
+      if (newBest) {
+        GameKit.text(ctx, "★ ニューレコード！ ★", cx, cy + 52, {
+          size: 18,
+          color: "#ff9a8a",
+          align: "center",
+          baseline: "middle"
+        });
+      }
+    }
+  },
+  onDrag({ dx, dy }) {
+    if (phase !== "play") return;
+    player.x += dx * 1.15;
+    player.y += dy * 1.15;
+    const m = player.r;
+    player.x = Math.max(m, Math.min(GameKit.width() - m, player.x));
+    player.y = Math.max(m, Math.min(GameKit.height() - m, player.y));
+  }
+});
+</script>
+</body>
+</html>
